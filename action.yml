@@ -1,0 +1,132 @@
+name: Waxseal
+description: Publish one attested npm package and matching GitHub release from a trusted tag.
+
+inputs:
+  artifact-name:
+    description: Name of the release artifact produced by this workflow run.
+    required: false
+    default: release-files-${{ github.run_id }}-${{ github.run_attempt }}
+  package-directory:
+    description: Repository-relative directory containing the package manifest and changelog.
+    required: false
+    default: '.'
+
+outputs:
+  package:
+    description: Published npm package name.
+    value: ${{ steps.identity.outputs.package }}
+  version:
+    description: Published npm package version without the v prefix.
+    value: ${{ steps.identity.outputs.version }}
+  tag:
+    description: Validated release tag.
+    value: ${{ steps.identity.outputs.tag }}
+  archive-sha256:
+    description: SHA-256 digest of the validated release archive.
+    value: ${{ steps.validate.outputs.archive-sha256 }}
+  release-url:
+    description: URL of the published immutable GitHub release.
+    value: ${{ steps.publish.outputs.release-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Require a GitHub-hosted Linux runner
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ "$RUNNER_OS" == Linux ]]
+        [[ "${RUNNER_ENVIRONMENT:-}" == github-hosted ]]
+
+    - name: Checkout the caller commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Identify trusted release
+      id: identity
+      shell: bash
+      env:
+        WAXSEAL_SOURCE: ${{ github.workspace }}
+        WAXSEAL_PACKAGE_DIRECTORY: ${{ inputs.package-directory }}
+      run: |
+        set -euo pipefail
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/scripts/publish-npm.py" identity \
+          --source "$WAXSEAL_SOURCE" \
+          --package-directory "$WAXSEAL_PACKAGE_DIRECTORY"
+
+    - name: Download this run's release artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/waxseal-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Validate inert release artifact
+      id: validate
+      shell: bash
+      env:
+        WAXSEAL_SOURCE: ${{ github.workspace }}
+        WAXSEAL_PACKAGE_DIRECTORY: ${{ inputs.package-directory }}
+        WAXSEAL_FILES: ${{ runner.temp }}/waxseal-${{ github.run_id }}-${{ github.run_attempt }}
+      run: |
+        set -euo pipefail
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/scripts/publish-npm.py" validate \
+          --source "$WAXSEAL_SOURCE" \
+          --package-directory "$WAXSEAL_PACKAGE_DIRECTORY" \
+          --files "$WAXSEAL_FILES"
+
+    - name: Attest build provenance
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: ${{ steps.validate.outputs.archive-path }}
+
+    - name: Verify build provenance
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WAXSEAL_SOURCE: ${{ github.workspace }}
+        WAXSEAL_PACKAGE_DIRECTORY: ${{ inputs.package-directory }}
+        WAXSEAL_FILES: ${{ steps.validate.outputs.files-directory }}
+        WAXSEAL_EXPECTED_SHA256: ${{ steps.validate.outputs.archive-sha256 }}
+      run: |
+        set -euo pipefail
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/scripts/publish-npm.py" verify-attestation \
+          --source "$WAXSEAL_SOURCE" \
+          --package-directory "$WAXSEAL_PACKAGE_DIRECTORY" \
+          --files "$WAXSEAL_FILES" \
+          --expected-sha256 "$WAXSEAL_EXPECTED_SHA256"
+
+    - name: Set up Node 26
+      id: node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 26
+        package-manager-cache: false
+
+    - name: Require npm OIDC support
+      shell: bash
+      env:
+        WAXSEAL_NODE_VERSION: ${{ steps.node.outputs.node-version }}
+      run: |
+        set -euo pipefail
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/scripts/publish-npm.py" check-npm
+
+    - name: Publish validated release
+      id: publish
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WAXSEAL_SOURCE: ${{ github.workspace }}
+        WAXSEAL_PACKAGE_DIRECTORY: ${{ inputs.package-directory }}
+        WAXSEAL_FILES: ${{ steps.validate.outputs.files-directory }}
+        WAXSEAL_EXPECTED_SHA256: ${{ steps.validate.outputs.archive-sha256 }}
+        WAXSEAL_NODE_VERSION: ${{ steps.node.outputs.node-version }}
+      run: |
+        set -euo pipefail
+        /usr/bin/python3 -I "$GITHUB_ACTION_PATH/scripts/publish-npm.py" publish \
+          --source "$WAXSEAL_SOURCE" \
+          --package-directory "$WAXSEAL_PACKAGE_DIRECTORY" \
+          --files "$WAXSEAL_FILES" \
+          --expected-sha256 "$WAXSEAL_EXPECTED_SHA256"
