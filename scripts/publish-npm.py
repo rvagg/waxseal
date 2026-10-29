@@ -4,6 +4,7 @@
 import base64
 import gzip
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -48,7 +49,7 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect
                                     urllib.request.HTTPSHandler(context=SYSTEM_TRUST))
 
 
-class NpmNotVisible(Exception):
+class NpmReadUnavailable(Exception):
     pass
 
 
@@ -87,19 +88,31 @@ def gh_json(*args, input=None):
         fail("GitHub API operation failed")
 
 
-def read_url(url, limit, *, allow_not_found=False):
+def read_url(url, limit, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NpmReadUnavailable(f"npm GET {url}: verification deadline expired")
     try:
-        with OPENER.open(url, timeout=30) as response:
+        with OPENER.open(url, timeout=min(30, remaining)) as response:
             length = response.headers.get("Content-Length")
             if length is not None and (not length.isdecimal() or int(length) > limit):
                 fail("npm response exceeds the size limit")
             data = response.read(limit + 1)
     except urllib.error.HTTPError as error:
-        if allow_not_found and error.code == 404:
-            raise FileNotFoundError from None
-        fail("npm request failed")
-    except (urllib.error.URLError, OSError):
-        fail("npm request failed")
+        status = error.code
+        error.close()
+        message = f"npm GET {url}: HTTP {status}"
+        if status in {404, 408, 429, 500, 502, 503, 504}:
+            raise NpmReadUnavailable(message) from None
+        fail(message)
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, ssl.SSLCertVerificationError):
+            fail(f"npm GET {url}: TLS certificate verification failed")
+        raise NpmReadUnavailable(f"npm GET {url}: {type(error.reason).__name__}") from None
+    except ssl.SSLCertVerificationError:
+        fail(f"npm GET {url}: TLS certificate verification failed")
+    except (OSError, http.client.IncompleteRead) as error:
+        raise NpmReadUnavailable(f"npm GET {url}: {type(error).__name__}") from None
     if len(data) > limit:
         fail("npm response exceeds the size limit")
     return data
@@ -551,11 +564,9 @@ def require_unpublished(package, version):
     fail("npm publication status could not be confirmed")
 
 
-def verify_npm(package, version, sha256):
+def verify_npm(package, version, sha256, deadline):
     try:
-        metadata = json.loads(read_url(registry_metadata_url(package, version), MAX_METADATA, allow_not_found=True))
-    except FileNotFoundError:
-        raise NpmNotVisible from None
+        metadata = json.loads(read_url(registry_metadata_url(package, version), MAX_METADATA, deadline))
     except (UnicodeDecodeError, json.JSONDecodeError):
         fail("npm metadata verification failed")
     tarball = registry_tarball_url(package, version)
@@ -571,7 +582,7 @@ def verify_npm(package, version, sha256):
         expected = base64.b64decode(integrity[7:], validate=True)
     except ValueError:
         fail("npm integrity is invalid")
-    data = read_url(tarball, MAX_ARCHIVE)
+    data = read_url(tarball, MAX_ARCHIVE, deadline)
     if hashlib.sha512(data).digest() != expected or hashlib.sha256(data).hexdigest() != sha256:
         fail("npm archive digest does not match the approved asset")
 
@@ -580,13 +591,17 @@ def wait_for_npm(package, version, sha256):
     deadline = time.monotonic() + 300
     while True:
         try:
-            verify_npm(package, version, sha256)
+            verify_npm(package, version, sha256, deadline)
             return
-        except NpmNotVisible:
+        except NpmReadUnavailable as error:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                fail("npm publication did not become visible")
-            time.sleep(min(5, remaining))
+                fail(f"npm publication verification timed out: {error}")
+            delay = min(5, remaining)
+            print(f"{error}; retrying verification in {delay:g}s", file=sys.stderr, flush=True)
+            time.sleep(delay)
+            if time.monotonic() >= deadline:
+                fail(f"npm publication verification timed out: {error}")
 
 
 def exact_draft(release, release_id, identity, size, digest, draft):

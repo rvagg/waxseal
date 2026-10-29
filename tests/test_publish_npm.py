@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Security and identity regressions for the inert npm publisher."""
 
+import base64
+import contextlib
 import gzip
+import hashlib
+import http.client
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import ssl
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "publish-npm.py"
@@ -341,6 +347,151 @@ class SourceBoundValidationTest(unittest.TestCase):
                     publish_npm.publish(identity)
             self.assertFalse(state["draft"])
             self.assertFalse(state["npm"])
+
+
+class RegistryVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.archive = package_archive("example", "1.2.3", "owner/repo")
+        self.sha256 = hashlib.sha256(self.archive).hexdigest()
+        self.metadata_url = publish_npm.registry_metadata_url("example", "1.2.3")
+        self.tarball_url = publish_npm.registry_tarball_url("example", "1.2.3")
+
+    def metadata(self, archive=None):
+        data = self.archive if archive is None else archive
+        return json.dumps({
+            "name": "example", "version": "1.2.3",
+            "dist": {"tarball": self.tarball_url,
+                     "integrity": "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()},
+        }).encode()
+
+    @staticmethod
+    def response(data):
+        response = io.BytesIO(data)
+        response.headers = {"Content-Length": str(len(data))}
+        return response
+
+    def http_error(self, status, tarball=False):
+        return urllib.error.HTTPError(self.tarball_url if tarball else self.metadata_url,
+                                      status, "untrusted server response", {}, None)
+
+    @contextlib.contextmanager
+    def registry(self, responses):
+        self.elapsed = 0
+        self.messages = io.StringIO()
+
+        def pause(seconds):
+            self.elapsed += seconds
+
+        with mock.patch.object(publish_npm.OPENER, "open", side_effect=responses) as requests, \
+             mock.patch.object(publish_npm.time, "monotonic", side_effect=lambda: self.elapsed), \
+             mock.patch.object(publish_npm.time, "sleep", side_effect=pause), \
+             contextlib.redirect_stderr(self.messages):
+            yield requests
+
+    def verify(self):
+        publish_npm.wait_for_npm("example", "1.2.3", self.sha256)
+
+    def test_finishes_after_metadata_and_tarball_errors_without_republishing(self):
+        responses = [self.http_error(429), self.http_error(503), self.response(self.metadata()),
+                     self.http_error(404, tarball=True), self.response(self.metadata()),
+                     self.response(self.archive)]
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = pathlib.Path(temporary) / "example-1.2.3.tgz"
+            archive.write_bytes(self.archive)
+            identity = {"repository": "owner/repo", "tag": "v1.2.3", "sha": SHA,
+                        "package": "example", "version": "1.2.3", "archive": archive,
+                        "archive-name": archive.name, "archive-sha256": self.sha256,
+                        "notes": "Release notes."}
+            state = {"npm_publications": 0}
+
+            def github(*args, input=None):
+                if args[0] == "--paginate":
+                    return [[]]
+                if args[:2] == ("--method", "POST"):
+                    state["release"] = json.loads(input) | {
+                        "id": 17, "assets": [], "immutable": False,
+                        "html_url": "https://github.com/owner/repo/releases/tag/v1.2.3",
+                    }
+                elif args[:2] == ("--method", "PATCH"):
+                    state["release"].update(draft=False, immutable=True)
+                return state["release"]
+
+            def command(*args, **kwargs):
+                if args[:3] == ("/node", "/npm", "publish"):
+                    state["npm_publications"] += 1
+                elif args[:2] == ("gh", "api"):
+                    state["release"]["assets"] = [{
+                        "name": archive.name, "size": len(self.archive),
+                        "digest": "sha256:" + self.sha256,
+                    }]
+                return ""
+
+            with self.registry(responses), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(publish_npm, "gh_json", side_effect=github), \
+                 mock.patch.object(publish_npm, "require_tag"), \
+                 mock.patch.object(publish_npm, "require_unpublished"), \
+                 mock.patch.object(publish_npm, "node_runtime", return_value=(pathlib.Path("/node"), pathlib.Path("/npm"))), \
+                 mock.patch.object(publish_npm, "verify_attestation"), \
+                 mock.patch.object(publish_npm, "run", side_effect=command):
+                publish_npm.publish(identity)
+            self.assertEqual(state["npm_publications"], 1)
+            self.assertFalse(state["release"]["draft"])
+            self.assertTrue(state["release"]["immutable"])
+
+    def test_recovers_from_connection_reset_and_truncated_response(self):
+        truncated = self.response(self.metadata())
+        truncated.read = mock.Mock(side_effect=http.client.IncompleteRead(b"partial", 100))
+        with self.registry([
+            urllib.error.URLError(ConnectionResetError("untrusted transport message")),
+            truncated, self.response(self.metadata()), self.response(self.archive),
+        ]):
+            self.verify()
+
+    def test_permanent_http_failure_is_not_retried_and_does_not_echo_response(self):
+        with self.registry([self.http_error(403)]) as requests:
+            with self.assertRaises(SystemExit) as failure:
+                self.verify()
+        self.assertEqual(requests.call_count, 1)
+        self.assertIn("403", str(failure.exception))
+        self.assertIn(self.metadata_url, str(failure.exception))
+        self.assertNotIn("untrusted server response", str(failure.exception))
+        self.assertEqual(self.elapsed, 0)
+
+    def test_certificate_failure_is_not_retried(self):
+        error = urllib.error.URLError(ssl.SSLCertVerificationError("untrusted TLS message"))
+        with self.registry([error]) as requests:
+            with self.assertRaises(SystemExit):
+                self.verify()
+        self.assertEqual(requests.call_count, 1)
+        self.assertEqual(self.elapsed, 0)
+
+    def test_persistent_transient_error_exhausts_budget_with_last_status(self):
+        def unavailable(*args, **kwargs):
+            raise self.http_error(503)
+
+        with self.registry(unavailable):
+            with self.assertRaises(SystemExit) as failure:
+                self.verify()
+        self.assertGreater(self.elapsed, 0)
+        self.assertLessEqual(self.elapsed, 300)
+        self.assertIn("503", str(failure.exception))
+        self.assertIn(self.metadata_url, str(failure.exception))
+
+    def test_changed_registry_bytes_are_not_retried_or_adopted(self):
+        changed = b"not the attested archive"
+        with self.registry([self.response(self.metadata(changed)), self.response(changed)]) as requests:
+            with self.assertRaises(SystemExit):
+                self.verify()
+        self.assertEqual(requests.call_count, 2)
+        self.assertEqual(self.elapsed, 0)
+
+    def test_invalid_metadata_is_not_retried(self):
+        with self.registry([self.response(b"not JSON")]) as requests:
+            with self.assertRaises(SystemExit):
+                self.verify()
+        self.assertEqual(requests.call_count, 1)
+        self.assertEqual(self.elapsed, 0)
 
 
 if __name__ == "__main__":
