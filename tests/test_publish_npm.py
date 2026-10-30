@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Security and identity regressions for the inert npm publisher."""
+"""npm archive, package identity and publication regressions."""
 
 import base64
 import contextlib
@@ -72,7 +72,7 @@ class ArchiveValidationTest(unittest.TestCase):
             archive = pathlib.Path(directory) / "example-1.2.3.tgz"
             archive.write_bytes(data)
             with self.assertRaises(SystemExit):
-                publish_npm.copy_raw_tar(archive, raw)
+                publish_npm.release_common.copy_raw_tar(archive, raw)
 
     def test_rejects_unsafe_alias_and_duplicate_members(self):
         for entries in (
@@ -127,7 +127,7 @@ class SourceBoundValidationTest(unittest.TestCase):
 
     def trusted(self, root, environment=None):
         with mock.patch.dict(os.environ, environment or self.environment(), clear=True), \
-             mock.patch.object(publish_npm, "run", return_value=f"{SHA}\n"):
+             mock.patch.object(publish_npm.release_common, "run", return_value=f"{SHA}\n"):
             return publish_npm.trusted_identity(root, root)
 
     def test_accepts_generic_unscoped_source_identity(self):
@@ -149,7 +149,7 @@ class SourceBoundValidationTest(unittest.TestCase):
             environment = self.environment()
             environment["RUNNER_TEMP"] = temporary
             with mock.patch.dict(os.environ, environment, clear=True), \
-                 mock.patch.object(publish_npm, "run", return_value=f"{SHA}\n"):
+                 mock.patch.object(publish_npm.release_common, "run", return_value=f"{SHA}\n"):
                 identity = publish_npm.validate(root, root, files)
             self.assertEqual(identity["archive-name"], "example-1.2.3.tgz")
 
@@ -163,7 +163,7 @@ class SourceBoundValidationTest(unittest.TestCase):
             (files / "example-1.2.3.tgz").write_bytes(package_archive("example", "1.2.3", "owner/repo"))
             environment = self.environment() | {"RUNNER_TEMP": temporary}
             with mock.patch.dict(os.environ, environment, clear=True), \
-                 mock.patch.object(publish_npm, "run", return_value=f"{SHA}\n"):
+                 mock.patch.object(publish_npm.release_common, "run", return_value=f"{SHA}\n"):
                 identity = publish_npm.validate(root, root, files)
                 manifest = json.dumps({
                     "name": "example", "version": "1.2.3",
@@ -176,7 +176,7 @@ class SourceBoundValidationTest(unittest.TestCase):
                 snapshot = pathlib.Path(identity["files-directory"])
                 with self.assertRaises(SystemExit):
                     publish_npm.validate_snapshot(root, root, snapshot, identity["archive-sha256"])
-                changed_digest = publish_npm.hash_file(identity["archive"])
+                changed_digest = publish_npm.release_common.hash_file(identity["archive"])
                 accepted = publish_npm.validate_snapshot(root, root, snapshot, changed_digest)
                 self.assertEqual(accepted["archive-sha256"], changed_digest)
 
@@ -205,7 +205,7 @@ class SourceBoundValidationTest(unittest.TestCase):
         text = ("## v1.2.3\nBefore\n````markdown\n```\n"
                 "## v1.2.4\nInside code\n````\nAfter code\n"
                 "## v1.2.4\nOutside release\n")
-        notes = publish_npm.release_notes(text, "1.2.3")
+        notes = publish_npm.release_common.release_notes(text, "1.2.3")
         self.assertIn("Inside code", notes)
         self.assertIn("After code", notes)
         self.assertNotIn("Outside release", notes)
@@ -220,7 +220,7 @@ class SourceBoundValidationTest(unittest.TestCase):
             environment.update(changes)
             with self.subTest(changes=changes), mock.patch.dict(os.environ, environment, clear=True):
                 with self.assertRaises(SystemExit):
-                    publish_npm.environment_identity()
+                    publish_npm.release_common.environment_identity()
 
     def test_rejects_escaping_package_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -232,12 +232,12 @@ class SourceBoundValidationTest(unittest.TestCase):
             for directory in ("..", "/tmp", "escape"):
                 with self.subTest(directory=directory):
                     with self.assertRaises(SystemExit):
-                        publish_npm.package_directory(root, directory)
+                        publish_npm.release_common.package_directory(root, directory)
 
     def test_extracts_fenced_crlf_utf8_changelog_notes(self):
         text = ("## v1.2.3\r\n\r\nRésumé\r\n\r\n## Context\r\n\r\n"
                 "```markdown\r\n## v1.2.3\r\n```\r\n\r\n## v1.2.4\r\nLater\r\n")
-        notes = publish_npm.release_notes(text, "1.2.3")
+        notes = publish_npm.release_common.release_notes(text, "1.2.3")
         self.assertIn("Résumé", notes)
         self.assertIn("## Context", notes)
         self.assertIn("## v1.2.3", notes)
@@ -250,7 +250,7 @@ class SourceBoundValidationTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 with self.assertRaises(SystemExit):
-                    publish_npm.release_notes(text, "1.2.3")
+                    publish_npm.release_common.release_notes(text, "1.2.3")
 
     def test_allows_only_documented_publish_configuration(self):
         publish_npm.validate_publish_config({
@@ -294,7 +294,7 @@ class SourceBoundValidationTest(unittest.TestCase):
             environment = self.environment()
             environment["RUNNER_TEMP"] = temporary
             with mock.patch.dict(os.environ, environment, clear=True), \
-                 mock.patch.object(publish_npm, "run", return_value=f"{SHA}\n"):
+                 mock.patch.object(publish_npm.release_common, "run", return_value=f"{SHA}\n"):
                 with self.assertRaises(SystemExit):
                     publish_npm.validate(root, root, files)
 
@@ -309,14 +309,14 @@ class SourceBoundValidationTest(unittest.TestCase):
             environment = self.environment()
             environment["RUNNER_TEMP"] = temporary
             with mock.patch.dict(os.environ, environment, clear=True), \
-                 mock.patch.object(publish_npm, "run", return_value=f"{SHA}\n"):
+                 mock.patch.object(publish_npm.release_common, "run", return_value=f"{SHA}\n"):
                 identity = publish_npm.validate(root, root, files)
             self.assertEqual(identity["archive-name"], "scope-name-1.2.3.tgz")
         self.assertEqual(publish_npm.registry_metadata_url("@scope/name", "1.2.3"),
                          "https://registry.npmjs.org/@scope%2Fname/1.2.3")
         self.assertEqual(publish_npm.registry_tarball_url("@scope/name", "1.2.3"),
                          "https://registry.npmjs.org/@scope/name/-/name-1.2.3.tgz")
-        self.assertEqual(publish_npm.canonical_repository("git+ssh://git@github.com/owner/repo.git"), "owner/repo")
+        self.assertEqual(publish_npm.release_common.canonical_repository("git+ssh://git@github.com/owner/repo.git"), "owner/repo")
 
     def test_existing_draft_prevents_all_publication_mutations(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -338,11 +338,11 @@ class SourceBoundValidationTest(unittest.TestCase):
                     state["npm"] = True
                 return ""
 
-            with mock.patch.object(publish_npm, "gh_json", side_effect=github), \
-                 mock.patch.object(publish_npm, "require_tag"), \
+            with mock.patch.object(publish_npm.release_common, "gh_json", side_effect=github), \
+                 mock.patch.object(publish_npm.release_common, "require_tag"), \
                  mock.patch.object(publish_npm, "node_runtime", return_value=(pathlib.Path("/node"), pathlib.Path("/npm"))), \
-                 mock.patch.object(publish_npm, "verify_attestation"), \
-                 mock.patch.object(publish_npm, "run", side_effect=command):
+                 mock.patch.object(publish_npm.release_common, "verify_attestation"), \
+                 mock.patch.object(publish_npm.release_common, "run", side_effect=command):
                 with self.assertRaises(SystemExit):
                     publish_npm.publish(identity)
             self.assertFalse(state["draft"])
@@ -382,7 +382,7 @@ class RegistryVerificationTest(unittest.TestCase):
         def pause(seconds):
             self.elapsed += seconds
 
-        with mock.patch.object(publish_npm.OPENER, "open", side_effect=responses) as requests, \
+        with mock.patch.object(publish_npm.release_common.OPENER, "open", side_effect=responses) as requests, \
              mock.patch.object(publish_npm.time, "monotonic", side_effect=lambda: self.elapsed), \
              mock.patch.object(publish_npm.time, "sleep", side_effect=pause), \
              contextlib.redirect_stderr(self.messages):
@@ -428,12 +428,12 @@ class RegistryVerificationTest(unittest.TestCase):
 
             with self.registry(responses), \
                  mock.patch.dict(os.environ, {}, clear=True), \
-                 mock.patch.object(publish_npm, "gh_json", side_effect=github), \
-                 mock.patch.object(publish_npm, "require_tag"), \
+                 mock.patch.object(publish_npm.release_common, "gh_json", side_effect=github), \
+                 mock.patch.object(publish_npm.release_common, "require_tag"), \
                  mock.patch.object(publish_npm, "require_unpublished"), \
                  mock.patch.object(publish_npm, "node_runtime", return_value=(pathlib.Path("/node"), pathlib.Path("/npm"))), \
-                 mock.patch.object(publish_npm, "verify_attestation"), \
-                 mock.patch.object(publish_npm, "run", side_effect=command):
+                 mock.patch.object(publish_npm.release_common, "verify_attestation"), \
+                 mock.patch.object(publish_npm.release_common, "run", side_effect=command):
                 publish_npm.publish(identity)
             self.assertEqual(state["npm_publications"], 1)
             self.assertFalse(state["release"]["draft"])

@@ -1,5 +1,5 @@
 name: Waxseal
-description: Publish one attested npm package and matching GitHub release from a trusted tag.
+description: Publish an npm tarball to npm and attach it to an immutable GitHub release.
 
 inputs:
   artifact-name:
@@ -19,10 +19,10 @@ outputs:
     description: Published npm package version without the v prefix.
     value: ${{ steps.identity.outputs.version }}
   tag:
-    description: Validated release tag.
+    description: Release tag.
     value: ${{ steps.identity.outputs.tag }}
   archive-sha256:
-    description: SHA-256 digest of the validated release archive.
+    description: SHA-256 of the package archive.
     value: ${{ steps.validate.outputs.archive-sha256 }}
   release-url:
     description: URL of the published immutable GitHub release.
@@ -45,7 +45,7 @@ runs:
         fetch-depth: 0
         persist-credentials: false
 
-    - name: Identify trusted release
+    - name: Check package and tag
       id: identity
       shell: bash
       env:
@@ -63,7 +63,7 @@ runs:
         name: ${{ inputs.artifact-name }}
         path: ${{ runner.temp }}/waxseal-${{ github.run_id }}-${{ github.run_attempt }}
 
-    - name: Validate inert release artifact
+    - name: Check package archive
       id: validate
       shell: bash
       env:
@@ -77,12 +77,12 @@ runs:
           --package-directory "$WAXSEAL_PACKAGE_DIRECTORY" \
           --files "$WAXSEAL_FILES"
 
-    - name: Attest build provenance
+    - name: Create GitHub attestation
       uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
       with:
         subject-path: ${{ steps.validate.outputs.archive-path }}
 
-    - name: Verify build provenance
+    - name: Verify GitHub attestation
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -113,7 +113,7 @@ runs:
         set -euo pipefail
         /usr/bin/python3 -I "$GITHUB_ACTION_PATH/scripts/publish-npm.py" check-npm
 
-    - name: Publish validated release
+    - name: Publish package and GitHub release
       id: publish
       shell: bash
       env:
