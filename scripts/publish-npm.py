@@ -312,8 +312,8 @@ def publish(identity):
         try:
             release_common.run("gh", "release", "verify", identity["tag"], "--repo", f"https://github.com/{identity['repository']}")
             release_common.run("gh", "release", "verify-asset", identity["tag"], str(archive), "--repo", f"https://github.com/{identity['repository']}")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            release_common.fail("GitHub release verification failed")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            release_common.fail_verifier(error)
     url = release.get("html_url")
     if not isinstance(url, str) or not url.startswith(f"https://github.com/{identity['repository']}/releases/"):
         release_common.fail("GitHub release URL is invalid")

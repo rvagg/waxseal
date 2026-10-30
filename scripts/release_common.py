@@ -25,6 +25,7 @@ MAX_MEMBERS = 10_000
 MAX_UNPACKED = 512 * 1024 * 1024
 MAX_CHANGELOG = 4 * 1024 * 1024
 MAX_ARTIFACT_ZIP = MAX_ARCHIVE + MAX_METADATA
+MAX_VERIFIER_DIAGNOSTIC = 4096
 
 VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -160,6 +161,34 @@ def run(*args, input=None, cwd=None, env=None, timeout=120):
     return subprocess.run(args, input=input, cwd=cwd, env=command_env, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           check=True, timeout=timeout).stdout
+
+
+def fail_verifier(error):
+    command = " ".join(error.cmd[:3])
+    if isinstance(error, subprocess.TimeoutExpired):
+        reason = f"timed out after {error.timeout} seconds"
+    else:
+        reason = f"failed with exit status {error.returncode}"
+    streams = []
+    for label, value in (("stderr", error.stderr), ("stdout", error.output)):
+        if value:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            streams.append(f"{label}:\n{value}")
+    details = "\n".join(streams)
+    tokens = {os.environ.get(name, "") for name in (
+        "GH_TOKEN", "GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "NODE_AUTH_TOKEN", "NPM_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN")}
+    for token in sorted(tokens - {""}, key=len, reverse=True):
+        details = details.replace(token, "[REDACTED]")
+    details = "".join(character if character.isprintable() or character in "\n\t"
+                      else ascii(character)[1:-1] for character in details)
+    # Captured output must not become GitHub workflow commands.
+    details = re.sub(r":{2,}", lambda match: r"\:" * len(match[0]), details).replace("##[", r"##\[")
+    if len(details) > MAX_VERIFIER_DIAGNOSTIC:
+        marker = "\n[output truncated]"
+        details = details[:MAX_VERIFIER_DIAGNOSTIC - len(marker)] + marker
+    fail(f"{command} {reason}" + (f"\n{details}" if details else ""))
 
 
 def gh_json(*args, input=None):
@@ -509,5 +538,5 @@ def verify_attestation(identity):
         run("gh", "attestation", "verify", str(identity["archive"]), "--repo", identity["repository"],
             "--signer-workflow", identity["signer"], "--source-ref", f"refs/tags/{identity['tag']}",
             "--source-digest", identity["sha"], "--signer-digest", identity["sha"], "--deny-self-hosted-runners")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        fail("build attestation verification failed")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        fail_verifier(error)
