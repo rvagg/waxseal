@@ -301,7 +301,7 @@ def publish(identity):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             release_common.fail("npm publication failed")
         wait_for_npm(identity["package"], identity["version"], identity["archive-sha256"])
-        release_common.require_tag(identity["repository"], identity["tag"], identity["sha"])
+        tag_sha = release_common.require_tag(identity["repository"], identity["tag"], identity["sha"])
         release = release_common.gh_json(f"repos/{identity['repository']}/releases/{release_id}")
         if not exact_draft(release, release_id, identity, size, digest, True):
             release_common.fail("GitHub draft changed before publication")
@@ -309,11 +309,7 @@ def publish(identity):
         release = release_common.gh_json(f"repos/{identity['repository']}/releases/{release_id}")
         if not exact_draft(release, release_id, identity, size, digest, False) or release.get("immutable") is not True:
             release_common.fail("GitHub release publication verification failed")
-        try:
-            release_common.run("gh", "release", "verify", identity["tag"], "--repo", f"https://github.com/{identity['repository']}")
-            release_common.run("gh", "release", "verify-asset", identity["tag"], str(archive), "--repo", f"https://github.com/{identity['repository']}")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            release_common.fail_verifier(error)
+        release_common.verify_release(identity, tag_sha)
     url = release.get("html_url")
     if not isinstance(url, str) or not url.startswith(f"https://github.com/{identity['repository']}/releases/"):
         release_common.fail("GitHub release URL is invalid")

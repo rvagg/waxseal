@@ -12,6 +12,7 @@ import signal
 import ssl
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -26,6 +27,7 @@ MAX_UNPACKED = 512 * 1024 * 1024
 MAX_CHANGELOG = 4 * 1024 * 1024
 MAX_ARTIFACT_ZIP = MAX_ARCHIVE + MAX_METADATA
 MAX_VERIFIER_DIAGNOSTIC = 4096
+RELEASE_ATTESTATION_TIMEOUT = 300
 
 VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -191,9 +193,9 @@ def fail_verifier(error):
     fail(f"{command} {reason}" + (f"\n{details}" if details else ""))
 
 
-def gh_json(*args, input=None):
+def gh_json(*args, input=None, timeout=120):
     try:
-        return json.loads(run("gh", "api", "--hostname", "github.com", *args, input=input))
+        return json.loads(run("gh", "api", "--hostname", "github.com", *args, input=input, timeout=timeout))
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
         fail("GitHub API operation failed")
 
@@ -518,16 +520,22 @@ def snapshot_zipped_artifact(files, name):
 
 def require_tag(repository, tag, sha):
     ref = gh_json(f"repos/{repository}/git/ref/tags/{tag}")
+    tag_sha = None
     for _ in range(16):
-        target = ref.get("object")
+        target = ref.get("object") if isinstance(ref, dict) else None
         if not isinstance(target, dict):
             break
         kind, object_sha = target.get("type"), target.get("sha")
+        if not isinstance(object_sha, str) or not SHA.fullmatch(object_sha):
+            break
+        if tag_sha is None:
+            # Annotated tags are attested by their tag-object digest.
+            tag_sha = object_sha
         if kind == "commit":
             if object_sha == sha:
-                return
+                return tag_sha
             break
-        if kind != "tag" or not isinstance(object_sha, str):
+        if kind != "tag":
             break
         ref = gh_json(f"repos/{repository}/git/tags/{object_sha}")
     fail("tag does not resolve to the approved commit")
@@ -538,5 +546,54 @@ def verify_attestation(identity):
         run("gh", "attestation", "verify", str(identity["archive"]), "--repo", identity["repository"],
             "--signer-workflow", identity["signer"], "--source-ref", f"refs/tags/{identity['tag']}",
             "--source-digest", identity["sha"], "--signer-digest", identity["sha"], "--deny-self-hosted-runners")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        fail_verifier(error)
+
+
+def wait_for_release_attestation(identity, tag_sha):
+    deadline = time.monotonic() + RELEASE_ATTESTATION_TIMEOUT
+    expired = ("Package and immutable GitHub release are already published; "
+               f"release attestation was not visible within {RELEASE_ATTESTATION_TIMEOUT} seconds. "
+               f"Verify manually: gh release verify {identity['tag']} --repo {identity['repository']}")
+    # The verifier hides HTTP lookup errors behind a missing-attestation message.
+    endpoint = (f"repos/{identity['repository']}/attestations/sha1:{tag_sha}"
+                "?per_page=100&predicate_type=release")
+    print("Package and immutable GitHub release are published; checking release attestation.",
+          file=sys.stderr, flush=True)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail(expired)
+        pages = gh_json("--paginate", "--slurp", endpoint, timeout=min(30, remaining))
+        if not isinstance(pages, list) or not pages:
+            fail("GitHub release attestation response is invalid")
+        attestations = []
+        for page in pages:
+            if (not isinstance(page, dict) or not isinstance(page.get("attestations"), list)
+                    or any(not isinstance(entry, dict) or not isinstance(entry.get("initiator"), str)
+                           for entry in page["attestations"])):
+                fail("GitHub release attestation response is invalid")
+            attestations.extend(entry for entry in page["attestations"] if entry["initiator"] == "github")
+        if any(not isinstance(entry.get("bundle"), dict)
+               and not (isinstance(entry.get("bundle_url"), str) and entry["bundle_url"])
+               for entry in attestations):
+            fail("GitHub release attestation response is invalid")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail(expired)
+        if attestations:
+            return
+        delay = min(5, remaining)
+        print(f"GitHub release attestation is not available; checking again in {delay:g}s",
+              file=sys.stderr, flush=True)
+        time.sleep(delay)
+
+
+def verify_release(identity, tag_sha):
+    wait_for_release_attestation(identity, tag_sha)
+    try:
+        run("gh", "release", "verify", identity["tag"], "--repo", f"https://github.com/{identity['repository']}")
+        run("gh", "release", "verify-asset", identity["tag"], str(identity["archive"]),
+            "--repo", f"https://github.com/{identity['repository']}")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         fail_verifier(error)

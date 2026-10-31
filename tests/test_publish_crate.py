@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -395,7 +396,7 @@ class RegistryVerificationTest(unittest.TestCase):
             with self.assertRaises(common.ReadUnavailable):
                 publish_crate.verify_crate("example", "1.2.3", self.sha256, 30)
 
-    def test_publication_waits_for_index_without_repeating_put(self):
+    def test_publication_waits_for_index_and_attestation_without_repeating_put(self):
         self.publication(mismatch=False)
 
     def test_integrity_failure_leaves_draft_unpublished(self):
@@ -408,9 +409,12 @@ class RegistryVerificationTest(unittest.TestCase):
             identity = UploadFramingTest().identity(archive) | {
                 "archive-name": archive.name, "archive-sha256": self.sha256, "tag": "v1.2.3", "sha": SHA,
                 "notes": "Approved notes.", "signer": "owner/repo/.github/workflows/publish.yml"}
-            state = {"release": None, "puts": 0, "reads": 0, "finalizations": 0}
+            state = {"release": None, "puts": 0, "reads": 0, "finalizations": 0, "attestations": 0}
 
-            def github(*args, input=None):
+            def github(*args, input=None, timeout=120):
+                if args[-1].startswith("repos/owner/repo/attestations/"):
+                    state["attestations"] += 1
+                    return [{"attestations": [] if state["attestations"] == 1 else [{"initiator": "github", "bundle": {}}]}]
                 if "--slurp" in args:
                     return [[]]
                 if "--method" in args and args[args.index("--method") + 1] == "POST":
@@ -425,6 +429,9 @@ class RegistryVerificationTest(unittest.TestCase):
                 if args[1:3] == ("api", "--method"):
                     state["release"]["assets"] = [{"name": archive.name, "size": archive.stat().st_size,
                                                    "digest": "sha256:" + self.sha256}]
+                if args[:3] == ("gh", "release", "verify") and state["attestations"] < 2:
+                    raise subprocess.CalledProcessError(1, args,
+                        stderr=f"no attestations for tag v1.2.3 (sha1:{SHA})")
                 return ""
 
             def registry(request, timeout):
@@ -443,7 +450,7 @@ class RegistryVerificationTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "secret"}, clear=True), \
                     mock.patch.object(common, "gh_json", side_effect=github), \
                     mock.patch.object(common, "run", side_effect=command), \
-                    mock.patch.object(common, "require_tag"), mock.patch.object(common, "verify_attestation"), \
+                    mock.patch.object(common, "require_tag", return_value=SHA), mock.patch.object(common, "verify_attestation"), \
                     mock.patch.object(common.OPENER, "open", side_effect=registry), \
                     mock.patch.object(common.time, "monotonic", side_effect=lambda: self.elapsed), \
                     mock.patch.object(common.time, "sleep", side_effect=lambda seconds: setattr(self, "elapsed", self.elapsed + seconds)), \

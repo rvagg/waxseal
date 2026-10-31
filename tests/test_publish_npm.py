@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import ssl
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -402,9 +403,12 @@ class RegistryVerificationTest(unittest.TestCase):
                         "package": "example", "version": "1.2.3", "archive": archive,
                         "archive-name": archive.name, "archive-sha256": self.sha256,
                         "notes": "Release notes."}
-            state = {"npm_publications": 0}
+            state = {"npm_publications": 0, "attestations": 0, "finalizations": 0}
 
-            def github(*args, input=None):
+            def github(*args, input=None, timeout=120):
+                if args[-1].startswith("repos/owner/repo/attestations/"):
+                    state["attestations"] += 1
+                    return [{"attestations": [] if state["attestations"] == 1 else [{"initiator": "github", "bundle": {}}]}]
                 if args[0] == "--paginate":
                     return [[]]
                 if args[:2] == ("--method", "POST"):
@@ -413,6 +417,7 @@ class RegistryVerificationTest(unittest.TestCase):
                         "html_url": "https://github.com/owner/repo/releases/tag/v1.2.3",
                     }
                 elif args[:2] == ("--method", "PATCH"):
+                    state["finalizations"] += 1
                     state["release"].update(draft=False, immutable=True)
                 return state["release"]
 
@@ -424,18 +429,22 @@ class RegistryVerificationTest(unittest.TestCase):
                         "name": archive.name, "size": len(self.archive),
                         "digest": "sha256:" + self.sha256,
                     }]
+                if args[:3] == ("gh", "release", "verify") and state["attestations"] < 2:
+                    raise subprocess.CalledProcessError(1, args,
+                        stderr=f"no attestations for tag v1.2.3 (sha1:{SHA})")
                 return ""
 
             with self.registry(responses), \
                  mock.patch.dict(os.environ, {}, clear=True), \
                  mock.patch.object(publish_npm.release_common, "gh_json", side_effect=github), \
-                 mock.patch.object(publish_npm.release_common, "require_tag"), \
+                 mock.patch.object(publish_npm.release_common, "require_tag", return_value=SHA), \
                  mock.patch.object(publish_npm, "require_unpublished"), \
                  mock.patch.object(publish_npm, "node_runtime", return_value=(pathlib.Path("/node"), pathlib.Path("/npm"))), \
                  mock.patch.object(publish_npm.release_common, "verify_attestation"), \
                  mock.patch.object(publish_npm.release_common, "run", side_effect=command):
                 publish_npm.publish(identity)
             self.assertEqual(state["npm_publications"], 1)
+            self.assertEqual(state["finalizations"], 1)
             self.assertFalse(state["release"]["draft"])
             self.assertTrue(state["release"]["immutable"])
 
