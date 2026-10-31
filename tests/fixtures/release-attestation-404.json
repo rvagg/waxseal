@@ -1,0 +1,6 @@
+{
+  "request": "GET /repos/rvagg/krasm/attestations/sha1:01bd9935dbc9038aefd33f771dcf6bbd759100aa?per_page=100&predicate_type=release",
+  "returncode": 1,
+  "stdout": "[{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/repos/attestations#list-attestations\",\"status\":\"404\"}]",
+  "stderr": "gh: Not Found (HTTP 404)\n"
+}

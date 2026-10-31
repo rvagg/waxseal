@@ -24,6 +24,7 @@ spec = importlib.util.spec_from_file_location("publish_npm", SCRIPT)
 publish_npm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publish_npm)
 SHA = "a" * 40
+ATTESTATION_NOT_FOUND = json.loads((pathlib.Path(__file__).parent / "fixtures" / "release-attestation-404.json").read_text())
 
 
 def tarball(entries):
@@ -403,15 +404,21 @@ class RegistryVerificationTest(unittest.TestCase):
                         "package": "example", "version": "1.2.3", "archive": archive,
                         "archive-name": archive.name, "archive-sha256": self.sha256,
                         "notes": "Release notes."}
-            state = {"npm_publications": 0, "attestations": 0, "finalizations": 0}
+            state = {"npm_publications": 0, "attestations": 0, "finalizations": 0,
+                     "drafts": 0, "asset_uploads": 0, "verify": 0, "verify_asset": 0}
+            original_github = publish_npm.release_common.gh_json
 
-            def github(*args, input=None, timeout=120):
+            def github(*args, input=None, **kwargs):
                 if args[-1].startswith("repos/owner/repo/attestations/"):
-                    state["attestations"] += 1
-                    return [{"attestations": [] if state["attestations"] == 1 else [{"initiator": "github", "bundle": {}}]}]
+                    return original_github(*args, input=input, **kwargs)
+                if args[-1].endswith("/git/ref/tags/v1.2.3"):
+                    return {"object": {"type": "tag", "sha": "b" * 40}}
+                if args[-1].endswith("/git/tags/" + "b" * 40):
+                    return {"object": {"type": "commit", "sha": SHA}}
                 if args[0] == "--paginate":
                     return [[]]
                 if args[:2] == ("--method", "POST"):
+                    state["drafts"] += 1
                     state["release"] = json.loads(input) | {
                         "id": 17, "assets": [], "immutable": False,
                         "html_url": "https://github.com/owner/repo/releases/tag/v1.2.3",
@@ -422,13 +429,24 @@ class RegistryVerificationTest(unittest.TestCase):
                 return state["release"]
 
             def command(*args, **kwargs):
+                if args[:2] == ("gh", "api") and args[-1].startswith("repos/owner/repo/attestations/"):
+                    state["attestations"] += 1
+                    if state["attestations"] == 1 or f"/attestations/sha1:{'b' * 40}?" not in args[-1]:
+                        raise subprocess.CalledProcessError(ATTESTATION_NOT_FOUND["returncode"], args,
+                            output=ATTESTATION_NOT_FOUND["stdout"], stderr=ATTESTATION_NOT_FOUND["stderr"])
+                    return json.dumps([{"attestations": [{"initiator": "github", "bundle": {}}]}])
                 if args[:3] == ("/node", "/npm", "publish"):
                     state["npm_publications"] += 1
                 elif args[:2] == ("gh", "api"):
+                    state["asset_uploads"] += 1
                     state["release"]["assets"] = [{
                         "name": archive.name, "size": len(self.archive),
                         "digest": "sha256:" + self.sha256,
                     }]
+                if args[:3] == ("gh", "release", "verify"):
+                    state["verify"] += 1
+                elif args[:3] == ("gh", "release", "verify-asset"):
+                    state["verify_asset"] += 1
                 if args[:3] == ("gh", "release", "verify") and state["attestations"] < 2:
                     raise subprocess.CalledProcessError(1, args,
                         stderr=f"no attestations for tag v1.2.3 (sha1:{SHA})")
@@ -437,16 +455,18 @@ class RegistryVerificationTest(unittest.TestCase):
             with self.registry(responses), \
                  mock.patch.dict(os.environ, {}, clear=True), \
                  mock.patch.object(publish_npm.release_common, "gh_json", side_effect=github), \
-                 mock.patch.object(publish_npm.release_common, "require_tag", return_value=SHA), \
                  mock.patch.object(publish_npm, "require_unpublished"), \
                  mock.patch.object(publish_npm, "node_runtime", return_value=(pathlib.Path("/node"), pathlib.Path("/npm"))), \
                  mock.patch.object(publish_npm.release_common, "verify_attestation"), \
                  mock.patch.object(publish_npm.release_common, "run", side_effect=command):
                 publish_npm.publish(identity)
             self.assertEqual(state["npm_publications"], 1)
+            self.assertEqual(state["drafts"], 1)
+            self.assertEqual(state["asset_uploads"], 1)
             self.assertEqual(state["finalizations"], 1)
             self.assertFalse(state["release"]["draft"])
             self.assertTrue(state["release"]["immutable"])
+            self.assertEqual((state["verify"], state["verify_asset"]), (1, 1))
 
     def test_recovers_from_connection_reset_and_truncated_response(self):
         truncated = self.response(self.metadata())

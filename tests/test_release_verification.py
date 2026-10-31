@@ -17,6 +17,12 @@ SHA = "a" * 40
 TAG_SHA = "b" * 40
 IDENTITY = {"repository": "owner/repo", "sha": SHA, "tag": "v1.2.3", "archive": pathlib.Path("example.crate")}
 READY = {"attestations": [{"initiator": "github", "bundle": {}}]}
+NOT_FOUND = json.loads((pathlib.Path(__file__).parent / "fixtures" / "release-attestation-404.json").read_text())
+
+
+def not_found_error(output=None):
+    return subprocess.CalledProcessError(NOT_FOUND["returncode"], ("gh", "api"),
+        output=NOT_FOUND["stdout"] if output is None else output, stderr=NOT_FOUND["stderr"])
 
 
 class ReleaseVerificationTest(unittest.TestCase):
@@ -54,12 +60,18 @@ class ReleaseVerificationTest(unittest.TestCase):
             if "/git/ref/tags/" in endpoint:
                 return {"object": {"type": "tag", "sha": TAG_SHA}}
             if endpoint.endswith("/git/tags/" + TAG_SHA):
+                return {"object": {"type": "tag", "sha": "c" * 40}}
+            if endpoint.endswith("/git/tags/" + "c" * 40):
                 return {"object": {"type": "commit", "sha": SHA}}
-            return READY if "/attestations/sha1:" + TAG_SHA + "?" in endpoint else {"attestations": []}
+            if "/attestations/sha1:" + TAG_SHA + "?" in endpoint:
+                if self.reads == 4:
+                    raise not_found_error()
+                return READY
+            return {"attestations": []}
         with self.commands(read):
             tag_sha = common.require_tag("owner/repo", "v1.2.3", SHA)
             common.verify_release(IDENTITY, tag_sha)
-        self.assertEqual(self.elapsed, 0)
+        self.assertGreater(self.elapsed, 0)
         self.assertEqual(self.verifications, ["verify", "verify-asset"])
 
     def test_tag_pointing_at_an_unapproved_commit_stops_before_verification(self):
@@ -71,7 +83,9 @@ class ReleaseVerificationTest(unittest.TestCase):
         self.assertEqual(self.verifications, [])
 
     def test_unavailable_attestation_exhausts_budget_and_names_manual_verification(self):
-        with self.commands(lambda endpoint: {"attestations": []}):
+        def read(endpoint):
+            raise not_found_error()
+        with self.commands(read):
             with self.assertRaises(SystemExit) as caught:
                 common.verify_release(IDENTITY, SHA)
         self.assertEqual(self.elapsed, common.RELEASE_ATTESTATION_TIMEOUT)
@@ -89,9 +103,12 @@ class ReleaseVerificationTest(unittest.TestCase):
 
     def test_permission_error_is_not_treated_as_absence(self):
         def read(endpoint):
-            raise subprocess.CalledProcessError(1, ("gh", "api"), stderr="HTTP 403: forbidden")
-        with self.commands(read), self.assertRaises(SystemExit):
+            raise subprocess.CalledProcessError(1, ("gh", "api"),
+                output=json.dumps([READY, {"message": "Forbidden", "status": "403"}]),
+                stderr="gh: Forbidden (HTTP 403)\n")
+        with self.commands(read), self.assertRaises(SystemExit) as caught:
             common.verify_release(IDENTITY, SHA)
+        self.assertIn("HTTP 403", str(caught.exception))
         self.assertEqual((self.reads, self.elapsed, self.verifications), (1, 0, []))
 
     def test_api_timeout_is_not_retried(self):
@@ -126,6 +143,55 @@ class ReleaseVerificationTest(unittest.TestCase):
             common.verify_release(IDENTITY, SHA)
         self.assertEqual(self.elapsed, 0)
         self.assertEqual(self.verifications, ["verify", "verify-asset"])
+
+    def test_recorded_http_404_is_retried_before_signature_checks(self):
+        def read(endpoint):
+            if self.reads == 1:
+                raise not_found_error()
+            return READY
+        with self.commands(read):
+            common.verify_release(IDENTITY, SHA)
+        self.assertEqual(self.reads, 2)
+        self.assertGreater(self.elapsed, 0)
+        self.assertEqual(self.verifications, ["verify", "verify-asset"])
+
+    def test_later_page_404_does_not_accept_partial_success(self):
+        def read(endpoint):
+            if self.reads == 1:
+                raise not_found_error(json.dumps([READY, json.loads(NOT_FOUND["stdout"])[0]]))
+            return READY
+        with self.commands(read):
+            common.verify_release(IDENTITY, SHA)
+        self.assertEqual(self.reads, 2)
+        self.assertGreater(self.elapsed, 0)
+        self.assertEqual(self.verifications, ["verify", "verify-asset"])
+
+    def test_403_error_text_cannot_impersonate_http_404(self):
+        def read(endpoint):
+            raise subprocess.CalledProcessError(1, ("gh", "api"),
+                output=json.dumps([{"errors": ["lookup failed (HTTP 404)"], "status": "403"}]),
+                stderr="gh: lookup failed (HTTP 404)\n")
+        with self.commands(read), self.assertRaises(SystemExit) as caught:
+            common.verify_release(IDENTITY, SHA)
+        self.assertIn("403", str(caught.exception))
+        self.assertEqual((self.reads, self.elapsed, self.verifications), (1, 0, []))
+
+    def test_api_404_body_cannot_override_the_actual_http_403(self):
+        def read(endpoint):
+            raise subprocess.CalledProcessError(1, ("gh", "api"), output=NOT_FOUND["stdout"],
+                stderr="gh: claimed (HTTP 404) (HTTP 403)\n")
+        with self.commands(read), self.assertRaises(SystemExit) as caught:
+            common.verify_release(IDENTITY, SHA)
+        self.assertIn("HTTP 403", str(caught.exception))
+        self.assertEqual((self.reads, self.elapsed, self.verifications), (1, 0, []))
+
+    def test_malformed_http_404_response_is_fatal(self):
+        def read(endpoint):
+            raise not_found_error("not JSON")
+        with self.commands(read), self.assertRaises(SystemExit) as caught:
+            common.verify_release(IDENTITY, SHA)
+        self.assertIn("HTTP 404", str(caught.exception))
+        self.assertEqual((self.reads, self.elapsed, self.verifications), (1, 0, []))
 
     def test_generic_missing_attestation_verifier_error_is_not_retried(self):
         error = subprocess.CalledProcessError(1, ("gh", "release", "verify"),

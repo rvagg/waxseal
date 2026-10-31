@@ -193,11 +193,32 @@ def fail_verifier(error):
     fail(f"{command} {reason}" + (f"\n{details}" if details else ""))
 
 
-def gh_json(*args, input=None, timeout=120):
+def gh_json(*args, input=None):
     try:
-        return json.loads(run("gh", "api", "--hostname", "github.com", *args, input=input, timeout=timeout))
+        return json.loads(run("gh", "api", "--hostname", "github.com", *args, input=input))
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
         fail("GitHub API operation failed")
+
+
+def release_attestation_pages(endpoint, timeout):
+    try:
+        return json.loads(run("gh", "api", "--hostname", "github.com", "--paginate", "--slurp",
+                              endpoint, timeout=timeout))
+    except subprocess.CalledProcessError as error:
+        # Error-array messages can spoof a status, so check the API data too.
+        if error.returncode == 1 and re.search(r"\(HTTP 404\)\s*\Z", error.stderr or ""):
+            try:
+                pages = json.loads(error.stdout)
+            except (TypeError, json.JSONDecodeError):
+                fail_verifier(error)
+            if (isinstance(pages, list) and pages and isinstance(pages[-1], dict)
+                    and pages[-1].get("status") == "404" and pages[-1].get("message") == "Not Found"):
+                raise ReadUnavailable("GitHub release attestation lookup returned HTTP 404") from None
+        fail_verifier(error)
+    except subprocess.TimeoutExpired as error:
+        fail_verifier(error)
+    except json.JSONDecodeError:
+        fail("GitHub release attestation response is invalid")
 
 
 @contextmanager
@@ -564,27 +585,33 @@ def wait_for_release_attestation(identity, tag_sha):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             fail(expired)
-        pages = gh_json("--paginate", "--slurp", endpoint, timeout=min(30, remaining))
-        if not isinstance(pages, list) or not pages:
-            fail("GitHub release attestation response is invalid")
-        attestations = []
-        for page in pages:
-            if (not isinstance(page, dict) or not isinstance(page.get("attestations"), list)
-                    or any(not isinstance(entry, dict) or not isinstance(entry.get("initiator"), str)
-                           for entry in page["attestations"])):
+        try:
+            pages = release_attestation_pages(endpoint, min(30, remaining))
+        except ReadUnavailable as error:
+            attestations = []
+            unavailable = str(error)
+        else:
+            if not isinstance(pages, list) or not pages:
                 fail("GitHub release attestation response is invalid")
-            attestations.extend(entry for entry in page["attestations"] if entry["initiator"] == "github")
-        if any(not isinstance(entry.get("bundle"), dict)
-               and not (isinstance(entry.get("bundle_url"), str) and entry["bundle_url"])
-               for entry in attestations):
-            fail("GitHub release attestation response is invalid")
+            attestations = []
+            for page in pages:
+                if (not isinstance(page, dict) or not isinstance(page.get("attestations"), list)
+                        or any(not isinstance(entry, dict) or not isinstance(entry.get("initiator"), str)
+                               for entry in page["attestations"])):
+                    fail("GitHub release attestation response is invalid")
+                attestations.extend(entry for entry in page["attestations"] if entry["initiator"] == "github")
+            if any(not isinstance(entry.get("bundle"), dict)
+                   and not (isinstance(entry.get("bundle_url"), str) and entry["bundle_url"])
+                   for entry in attestations):
+                fail("GitHub release attestation response is invalid")
+            unavailable = "GitHub release attestation is not available"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             fail(expired)
         if attestations:
             return
         delay = min(5, remaining)
-        print(f"GitHub release attestation is not available; checking again in {delay:g}s",
+        print(f"{unavailable}; checking again in {delay:g}s",
               file=sys.stderr, flush=True)
         time.sleep(delay)
 

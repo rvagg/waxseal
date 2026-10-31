@@ -22,6 +22,7 @@ publish_crate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publish_crate)
 common = publish_crate.release_common
 SHA = "a" * 40
+ATTESTATION_NOT_FOUND = json.loads((pathlib.Path(__file__).parent / "fixtures" / "release-attestation-404.json").read_text())
 MANIFEST = b'''[package]
 name = "example"
 version = "1.2.3"
@@ -402,22 +403,32 @@ class RegistryVerificationTest(unittest.TestCase):
     def test_integrity_failure_leaves_draft_unpublished(self):
         self.publication(mismatch=True)
 
-    def publication(self, mismatch):
+    def test_attestation_exhaustion_preserves_publication_without_success_output(self):
+        self.publication(mismatch=False, missing_attestation=True)
+
+    def publication(self, mismatch, missing_attestation=False):
         with tempfile.TemporaryDirectory() as temporary:
             archive = pathlib.Path(temporary) / "example-1.2.3.crate"
             archive.write_bytes(self.archive)
+            output = pathlib.Path(temporary) / "outputs"
             identity = UploadFramingTest().identity(archive) | {
                 "archive-name": archive.name, "archive-sha256": self.sha256, "tag": "v1.2.3", "sha": SHA,
                 "notes": "Approved notes.", "signer": "owner/repo/.github/workflows/publish.yml"}
-            state = {"release": None, "puts": 0, "reads": 0, "finalizations": 0, "attestations": 0}
+            state = {"release": None, "puts": 0, "reads": 0, "finalizations": 0, "attestations": 0,
+                     "drafts": 0, "asset_uploads": 0, "verify": 0, "verify_asset": 0}
+            original_github = common.gh_json
 
-            def github(*args, input=None, timeout=120):
+            def github(*args, input=None, **kwargs):
                 if args[-1].startswith("repos/owner/repo/attestations/"):
-                    state["attestations"] += 1
-                    return [{"attestations": [] if state["attestations"] == 1 else [{"initiator": "github", "bundle": {}}]}]
+                    return original_github(*args, input=input, **kwargs)
+                if args[-1].endswith("/git/ref/tags/v1.2.3"):
+                    return {"object": {"type": "tag", "sha": "b" * 40}}
+                if args[-1].endswith("/git/tags/" + "b" * 40):
+                    return {"object": {"type": "commit", "sha": SHA}}
                 if "--slurp" in args:
                     return [[]]
                 if "--method" in args and args[args.index("--method") + 1] == "POST":
+                    state["drafts"] += 1
                     state["release"] = json.loads(input) | {"id": 7, "assets": [],
                         "html_url": "https://github.com/owner/repo/releases/tag/v1.2.3"}
                 elif "--method" in args:
@@ -426,9 +437,20 @@ class RegistryVerificationTest(unittest.TestCase):
                 return state["release"].copy()
 
             def command(*args, **kwargs):
+                if args[:2] == ("gh", "api") and args[-1].startswith("repos/owner/repo/attestations/"):
+                    state["attestations"] += 1
+                    if missing_attestation or state["attestations"] == 1 or f"/attestations/sha1:{'b' * 40}?" not in args[-1]:
+                        raise subprocess.CalledProcessError(ATTESTATION_NOT_FOUND["returncode"], args,
+                            output=ATTESTATION_NOT_FOUND["stdout"], stderr=ATTESTATION_NOT_FOUND["stderr"])
+                    return json.dumps([{"attestations": [{"initiator": "github", "bundle": {}}]}])
                 if args[1:3] == ("api", "--method"):
+                    state["asset_uploads"] += 1
                     state["release"]["assets"] = [{"name": archive.name, "size": archive.stat().st_size,
                                                    "digest": "sha256:" + self.sha256}]
+                if args[:3] == ("gh", "release", "verify"):
+                    state["verify"] += 1
+                elif args[:3] == ("gh", "release", "verify-asset"):
+                    state["verify_asset"] += 1
                 if args[:3] == ("gh", "release", "verify") and state["attestations"] < 2:
                     raise subprocess.CalledProcessError(1, args,
                         stderr=f"no attestations for tag v1.2.3 (sha1:{SHA})")
@@ -447,22 +469,32 @@ class RegistryVerificationTest(unittest.TestCase):
                 state["puts"] += 1
                 return response(b'{"warnings":{}}')
 
-            with mock.patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "secret"}, clear=True), \
+            with mock.patch.dict(os.environ, {"CARGO_REGISTRY_TOKEN": "secret", "GITHUB_OUTPUT": str(output)}, clear=True), \
                     mock.patch.object(common, "gh_json", side_effect=github), \
                     mock.patch.object(common, "run", side_effect=command), \
-                    mock.patch.object(common, "require_tag", return_value=SHA), mock.patch.object(common, "verify_attestation"), \
+                    mock.patch.object(common, "verify_attestation"), \
                     mock.patch.object(common.OPENER, "open", side_effect=registry), \
                     mock.patch.object(common.time, "monotonic", side_effect=lambda: self.elapsed), \
                     mock.patch.object(common.time, "sleep", side_effect=lambda seconds: setattr(self, "elapsed", self.elapsed + seconds)), \
                     contextlib.redirect_stderr(io.StringIO()):
-                if mismatch:
+                if mismatch or missing_attestation:
                     with self.assertRaises(SystemExit):
                         publish_crate.publish(identity)
                 else:
                     publish_crate.publish(identity)
             self.assertEqual(state["puts"], 1)
+            self.assertEqual(state["drafts"], 1)
+            self.assertEqual(state["asset_uploads"], 1)
             self.assertEqual(state["finalizations"], 0 if mismatch else 1)
             self.assertEqual(state["release"]["draft"], mismatch)
+            if mismatch or missing_attestation:
+                self.assertFalse(output.exists())
+                self.assertEqual((state["verify"], state["verify_asset"]), (0, 0))
+            else:
+                self.assertEqual((state["verify"], state["verify_asset"]), (1, 1))
+                self.assertEqual(output.read_text(), "release-url=https://github.com/owner/repo/releases/tag/v1.2.3\n")
+            if missing_attestation:
+                self.assertTrue(state["release"]["immutable"])
 
 
 if __name__ == "__main__":

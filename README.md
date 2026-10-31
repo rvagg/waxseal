@@ -30,9 +30,9 @@ Waxseal records the archive's hash, workflow and commit in a GitHub attestation.
 
 Waxseal retries registry reads for up to five minutes. Metadata, authentication, certificate and checksum errors stop the action. Uploads and GitHub writes are attempted once.
 
-After publishing the immutable GitHub release, Waxseal waits up to five minutes for GitHub's release attestation. Only successful lookups without a GitHub-issued record are repeated; lookup errors and signature failures stop the action.
+After publishing the immutable GitHub release, Waxseal waits up to five minutes for GitHub's release attestation. GitHub can return HTTP 404 while this record is unavailable. Waxseal retries that response and successful lookups without a GitHub-issued record. Other request errors and signature failures stop the action.
 
-Verifier failures include the command, exit status or timeout, and up to 4,096 characters of diagnostic output. Waxseal redacts known token values and escapes workflow commands and terminal controls before logging the output.
+Attestation lookup and verifier failures include the command, exit status or timeout, and up to 4,096 characters of diagnostic output. Waxseal redacts known token values and escapes workflow commands and terminal controls before logging the output.
 
 If publication stops part-way through, inspect the registry version and GitHub draft. If the package is already published, keep the draft and archive, verify their contents, and finish that release manually. Rerunning Waxseal stops when it finds an existing version, draft or release.
 
